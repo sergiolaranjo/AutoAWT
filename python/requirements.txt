@@ -1,0 +1,10 @@
+numpy
+pydicom
+Pillow
+scipy
+numba
+
+# GPU acceleration (optional, requires NVIDIA GPU + CUDA)
+# Install with: pip install cupy-cuda12x
+# or: pip install cupy-cuda11x
+# CuPy is auto-detected at runtime; falls back to NumPy if unavailable.
