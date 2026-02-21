@@ -1,0 +1,8 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Generated output
+datasets/*/BMP-*/
+datasets/*/Results/
