@@ -250,6 +250,54 @@ def _build_rhs(in_vol, shape, interior_indices, vol_to_eq):
     return b
 
 
+def _solve_sparse_gpu(A_csr, b_vec, method='cg', tol=1e-5, maxiter=500):
+    """Solve sparse system on GPU using CuPy.
+
+    Args:
+        A_csr: scipy CSR matrix
+        b_vec: numpy RHS vector
+        method: 'cg' (symmetric) or 'bicgstab' (non-symmetric)
+        tol: convergence tolerance
+        maxiter: maximum iterations
+
+    Returns:
+        (x, info) or None if GPU solve fails
+    """
+    if not GPU_AVAILABLE:
+        return None
+    try:
+        import cupy as cp
+        import cupyx.scipy.sparse as csp
+        import cupyx.scipy.sparse.linalg as csla
+
+        # Ensure compatible dtypes — CuPy sparse needs float64 or float32
+        A_f64 = A_csr.astype(np.float64)
+        b_f64 = b_vec.astype(np.float64)
+
+        A_gpu = csp.csr_matrix(A_f64)
+        b_gpu = cp.asarray(b_f64)
+
+        t0 = time.time()
+        if method == 'cg':
+            x_gpu, info = csla.cg(A_gpu, b_gpu, tol=tol, maxiter=maxiter)
+        elif method == 'bicgstab':
+            # CuPy doesn't have bicgstab — use cg for symmetric or lsqr fallback
+            try:
+                x_gpu, info = csla.lsqr(A_gpu, b_gpu)[:2]
+            except (AttributeError, TypeError):
+                x_gpu, info = csla.cg(A_gpu, b_gpu, tol=tol, maxiter=maxiter)
+        else:
+            x_gpu, info = csla.cg(A_gpu, b_gpu, tol=tol, maxiter=maxiter)
+
+        dt = time.time() - t0
+        print(f"  GPU sparse solve: {dt:.2f}s (info={info})", file=sys.stderr)
+        return cp.asnumpy(x_gpu), info
+
+    except Exception as e:
+        print(f"  GPU sparse solve failed: {e}", file=sys.stderr)
+        return None
+
+
 def _solve_with_amg_cg(A, b, tol=1e-5, maxiter=500):
     """Solve Ax=b using CG with optional AMG preconditioner (Phase 2).
 
@@ -265,19 +313,10 @@ def _solve_with_amg_cg(A, b, tol=1e-5, maxiter=500):
         x: solution vector
         info: convergence info (0 = success)
     """
-    if GPU_AVAILABLE:
-        try:
-            import cupyx.scipy.sparse as csp
-            import cupyx.scipy.sparse.linalg as csla
-            import cupy as cp
-
-            # Phase 3: GPU sparse CG
-            A_gpu = csp.csr_matrix(A)
-            b_gpu = cp.asarray(b)
-            x_gpu, info = csla.cg(A_gpu, b_gpu, rtol=tol, maxiter=maxiter)
-            return cp.asnumpy(x_gpu), info
-        except Exception:
-            pass
+    # Phase 3: GPU sparse CG
+    result = _solve_sparse_gpu(A, b, method='cg', tol=tol, maxiter=maxiter)
+    if result is not None:
+        return result
 
     # Phase 2: AMG-preconditioned CG (CPU)
     if HAS_PYAMG:
@@ -390,24 +429,31 @@ def compute_laplace_with_vector(in_vol, G_field, wall_mask, iterations):
     t1 = time.time()
     print(f"Laplace+Vector CG solved in {t1-t0:.2f}s (info={info})", file=sys.stderr)
 
-    # Compute gradient field ONCE (central differences) - no per-iteration overhead
-    dx = np.zeros_like(result)
-    dy = np.zeros_like(result)
-    dz = np.zeros_like(result)
+    # Compute gradient field ONCE (central differences) — GPU-accelerated if available
+    _xp = xp
+    result_d = to_device(result)
 
-    dx[:, :, 1:-1] = (result[:, :, 2:] - result[:, :, :-2]) * 0.5
-    dy[:, 1:-1, :] = (result[:, 2:, :] - result[:, :-2, :]) * 0.5
-    dz[1:-1, :, :] = (result[2:, :, :] - result[:-2, :, :]) * 0.5
+    dx = _xp.zeros_like(result_d)
+    dy = _xp.zeros_like(result_d)
+    dz = _xp.zeros_like(result_d)
 
-    grad_mag = np.sqrt(dx * dx + dy * dy + dz * dz)
+    dx[:, :, 1:-1] = (result_d[:, :, 2:] - result_d[:, :, :-2]) * 0.5
+    dy[:, 1:-1, :] = (result_d[:, 2:, :] - result_d[:, :-2, :]) * 0.5
+    dz[1:-1, :, :] = (result_d[2:, :, :] - result_d[:-2, :, :]) * 0.5
+
+    grad_mag = _xp.sqrt(dx * dx + dy * dy + dz * dz)
 
     # Normalize gradient and store in G_field
+    G_field_d = to_device(G_field)
     valid = grad_mag > 0
-    if np.any(valid):
+    if _xp.any(valid):
         inv_mag = 1.0 / grad_mag[valid]
-        G_field[valid, 0] = (dx[valid] * inv_mag).astype(np.float32)
-        G_field[valid, 1] = (dy[valid] * inv_mag).astype(np.float32)
-        G_field[valid, 2] = (dz[valid] * inv_mag).astype(np.float32)
+        G_field_d[valid, 0] = (dx[valid] * inv_mag).astype(_xp.float32)
+        G_field_d[valid, 1] = (dy[valid] * inv_mag).astype(_xp.float32)
+        G_field_d[valid, 2] = (dz[valid] * inv_mag).astype(_xp.float32)
+
+    G_field = to_numpy(G_field_d)
+    del result_d, dx, dy, dz, grad_mag, G_field_d
 
     return result, G_field
 
@@ -603,20 +649,25 @@ def compute_thickness_coupled_pde(phi, vectorfields, wall_mask, voxel_size):
     D, H, W = shape
     sx, sy, sz = float(voxel_size[0]), float(voxel_size[1]), float(voxel_size[2])
 
-    # Compute gradient of phi in PHYSICAL units (mm)
-    grad_phi = np.zeros((*shape, 3), dtype=np.float32)
-    grad_phi[:, :, 1:-1, 0] = (phi[:, :, 2:] - phi[:, :, :-2]) * 0.5 / sx
-    grad_phi[:, 1:-1, :, 1] = (phi[:, 2:, :] - phi[:, :-2, :]) * 0.5 / sy
-    grad_phi[1:-1, :, :, 2] = (phi[2:, :, :] - phi[:-2, :, :]) * 0.5 / sz
+    # Compute gradient of phi in PHYSICAL units (mm) — use GPU if available
+    _xp = xp  # CuPy on GPU, NumPy on CPU
+    phi_d = to_device(phi)
+
+    grad_phi_d = _xp.zeros((*shape, 3), dtype=_xp.float32)
+    grad_phi_d[:, :, 1:-1, 0] = (phi_d[:, :, 2:] - phi_d[:, :, :-2]) * (0.5 / sx)
+    grad_phi_d[:, 1:-1, :, 1] = (phi_d[:, 2:, :] - phi_d[:, :-2, :]) * (0.5 / sy)
+    grad_phi_d[1:-1, :, :, 2] = (phi_d[2:, :, :] - phi_d[:-2, :, :]) * (0.5 / sz)
 
     # Normalize to unit normal: n = grad(phi) / |grad(phi)|
-    # This ensures (n . grad(T)) = 1 gives T in physical distance (mm)
-    mag = np.sqrt(grad_phi[:, :, :, 0]**2 + grad_phi[:, :, :, 1]**2 +
-                  grad_phi[:, :, :, 2]**2)
-    mag = np.maximum(mag, 1e-12)  # avoid division by zero
-    grad_phi[:, :, :, 0] /= mag
-    grad_phi[:, :, :, 1] /= mag
-    grad_phi[:, :, :, 2] /= mag
+    mag = _xp.sqrt(grad_phi_d[:, :, :, 0]**2 + grad_phi_d[:, :, :, 1]**2 +
+                   grad_phi_d[:, :, :, 2]**2)
+    mag = _xp.maximum(mag, 1e-12)
+    grad_phi_d[:, :, :, 0] /= mag
+    grad_phi_d[:, :, :, 1] /= mag
+    grad_phi_d[:, :, :, 2] /= mag
+
+    grad_phi = to_numpy(grad_phi_d)
+    del phi_d, grad_phi_d, mag
 
     # Identify regions
     endo_surface = (vectorfields == 1.0)
@@ -638,10 +689,14 @@ def compute_thickness_coupled_pde(phi, vectorfields, wall_mask, voxel_size):
     n_unknowns = len(idx_endo)
     print(f"Solving coupled PDE for T_endo ({n_unknowns} unknowns)...", file=sys.stderr)
 
-    # Use BiCGSTAB (low memory) instead of GMRES for this advection system
-    T_endo_vals, info_endo = sla.bicgstab(A_endo, b_endo, rtol=1e-4, maxiter=500)
+    # Try GPU first, then CPU BiCGSTAB, then spsolve
+    gpu_result = _solve_sparse_gpu(A_endo, b_endo, method='bicgstab', tol=1e-4, maxiter=500)
+    if gpu_result is not None:
+        T_endo_vals, info_endo = gpu_result
+    else:
+        T_endo_vals, info_endo = sla.bicgstab(A_endo, b_endo, rtol=1e-4, maxiter=500)
     if info_endo != 0:
-        print(f"  T_endo BiCGSTAB info={info_endo}, trying spsolve", file=sys.stderr)
+        print(f"  T_endo solver info={info_endo}, trying spsolve", file=sys.stderr)
         try:
             T_endo_vals = sla.spsolve(A_endo, b_endo)
         except Exception:
@@ -660,9 +715,13 @@ def compute_thickness_coupled_pde(phi, vectorfields, wall_mask, voxel_size):
     b_epi = np.ones(len(idx_epi), dtype=np.float64)
 
     print(f"Solving coupled PDE for T_epi ({len(idx_epi)} unknowns)...", file=sys.stderr)
-    T_epi_vals, info_epi = sla.bicgstab(A_epi, b_epi, rtol=1e-4, maxiter=500)
+    gpu_result = _solve_sparse_gpu(A_epi, b_epi, method='bicgstab', tol=1e-4, maxiter=500)
+    if gpu_result is not None:
+        T_epi_vals, info_epi = gpu_result
+    else:
+        T_epi_vals, info_epi = sla.bicgstab(A_epi, b_epi, rtol=1e-4, maxiter=500)
     if info_epi != 0:
-        print(f"  T_epi BiCGSTAB info={info_epi}, trying spsolve", file=sys.stderr)
+        print(f"  T_epi solver info={info_epi}, trying spsolve", file=sys.stderr)
         try:
             T_epi_vals = sla.spsolve(A_epi, b_epi)
         except Exception:
@@ -934,6 +993,42 @@ if GPU_AVAILABLE:
         import cupy as cp
 
         _GPU_RK4_KERNEL_CODE = r"""
+// Trilinear interpolation of a 4-component vector field on GPU
+__device__ void trilinear_vf(
+    const float* vf, int W, int H, int D,
+    float px, float py, float pz,
+    float &ox, float &oy, float &oz, float &ow
+) {
+    float fx = fminf(fmaxf(px, 0.0f), (float)(W - 1) - 0.001f);
+    float fy = fminf(fmaxf(py, 0.0f), (float)(H - 1) - 0.001f);
+    float fz = fminf(fmaxf(pz, 0.0f), (float)(D - 1) - 0.001f);
+
+    int x0 = (int)fx, y0 = (int)fy, z0 = (int)fz;
+    int x1 = min(x0 + 1, W - 1);
+    int y1 = min(y0 + 1, H - 1);
+    int z1 = min(z0 + 1, D - 1);
+
+    float xd = fx - x0, yd = fy - y0, zd = fz - z0;
+
+    // 8 corners, 4 components each
+    #define VF4(X,Y,Z,C) vf[((Z)*H + (Y))*W*4 + (X)*4 + (C)]
+
+    for (int c = 0; c < 4; c++) {
+        float c00 = VF4(x0,y0,z0,c)*(1-xd) + VF4(x1,y0,z0,c)*xd;
+        float c01 = VF4(x0,y0,z1,c)*(1-xd) + VF4(x1,y0,z1,c)*xd;
+        float c10 = VF4(x0,y1,z0,c)*(1-xd) + VF4(x1,y1,z0,c)*xd;
+        float c11 = VF4(x0,y1,z1,c)*(1-xd) + VF4(x1,y1,z1,c)*xd;
+        float c0 = c00*(1-yd) + c10*yd;
+        float c1 = c01*(1-yd) + c11*yd;
+        float val = c0*(1-zd) + c1*zd;
+        if (c == 0) ox = val;
+        else if (c == 1) oy = val;
+        else if (c == 2) oz = val;
+        else ow = val;
+    }
+    #undef VF4
+}
+
 extern "C" __global__
 void rk4_thickness_kernel(
     const float* vertices,     // Nx3
@@ -969,7 +1064,7 @@ void rk4_thickness_kernel(
     bool state = true;
     float thickness = 0.0f;
     float dt = 0.05f;
-    int max_steps = 5120;  // 256 / 0.05
+    int max_steps = 5120;
 
     for (int step = 0; step < max_steps; step++) {
         int ix = (int)px;
@@ -978,11 +1073,10 @@ void rk4_thickness_kernel(
 
         if (ix >= W || iy >= H || iz >= D || ix < 0 || iy < 0 || iz < 0) break;
 
-        int vidx = ((iz * H + iy) * W + ix) * 4;
-        float vf0 = vector_fields[vidx + 0];
-        float vf1 = vector_fields[vidx + 1];
-        float vf2 = vector_fields[vidx + 2];
-        float vf3 = vector_fields[vidx + 3];
+        // Trilinear-interpolated vector field at current position
+        float vf0, vf1, vf2, vf3;
+        trilinear_vf(vector_fields, W, H, D, px - 0.5f, py - 0.5f, pz - 0.5f,
+                     vf0, vf1, vf2, vf3);
 
         if (vf3 > 0) {
             state = false;
@@ -997,10 +1091,36 @@ void rk4_thickness_kernel(
                 if (dir_len > 0) {
                     float prev_px = px, prev_py = py, prev_pz = pz;
 
-                    // Simple Euler on GPU (RK4 would need trilinear which is complex in CUDA)
-                    px += dx * dt;
-                    py += dy * dt;
-                    pz += dz * dt;
+                    // RK4 integration with trilinear interpolation
+                    // k1
+                    float k1x = dx * dt, k1y = dy * dt, k1z = dz * dt;
+
+                    // k2 — midpoint using k1
+                    float mx = px + k1x*0.5f - 0.5f;
+                    float my = py + k1y*0.5f - 0.5f;
+                    float mz = pz + k1z*0.5f - 0.5f;
+                    float m0, m1, m2, m3;
+                    trilinear_vf(vector_fields, W, H, D, mx, my, mz, m0, m1, m2, m3);
+                    float k2x = m0*mode_sign*dt, k2y = m1*mode_sign*dt, k2z = m2*mode_sign*dt;
+
+                    // k3 — midpoint using k2
+                    mx = px + k2x*0.5f - 0.5f;
+                    my = py + k2y*0.5f - 0.5f;
+                    mz = pz + k2z*0.5f - 0.5f;
+                    trilinear_vf(vector_fields, W, H, D, mx, my, mz, m0, m1, m2, m3);
+                    float k3x = m0*mode_sign*dt, k3y = m1*mode_sign*dt, k3z = m2*mode_sign*dt;
+
+                    // k4 — endpoint using k3
+                    mx = px + k3x - 0.5f;
+                    my = py + k3y - 0.5f;
+                    mz = pz + k3z - 0.5f;
+                    trilinear_vf(vector_fields, W, H, D, mx, my, mz, m0, m1, m2, m3);
+                    float k4x = m0*mode_sign*dt, k4y = m1*mode_sign*dt, k4z = m2*mode_sign*dt;
+
+                    // Weighted sum
+                    px += (k1x + 2*k2x + 2*k3x + k4x) / 6.0f;
+                    py += (k1y + 2*k2y + 2*k3y + k4y) / 6.0f;
+                    pz += (k1z + 2*k2z + 2*k3z + k4z) / 6.0f;
 
                     int wix = min(max((int)prev_px, 0), W - 1);
                     int wiy = min(max((int)prev_py, 0), H - 1);
