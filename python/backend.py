@@ -38,20 +38,15 @@ try:
         GPU_NAME = f"CUDA CC {GPU_COMPUTE_CAP[0]}.{GPU_COMPUTE_CAP[1]}"
 
     # ---- A100/H100 optimizations ----
-    cc_major = int(GPU_COMPUTE_CAP[0]) if isinstance(GPU_COMPUTE_CAP, (tuple, list, str)) else GPU_COMPUTE_CAP
-    if hasattr(GPU_COMPUTE_CAP, '__len__'):
-        cc_major = int(GPU_COMPUTE_CAP[0])
-    else:
-        cc_major = int(str(GPU_COMPUTE_CAP)[0]) if GPU_COMPUTE_CAP >= 10 else int(GPU_COMPUTE_CAP)
+    # GPU_COMPUTE_CAP is always a tuple (major, minor) from Device.compute_capability
+    cc_major = int(GPU_COMPUTE_CAP[0])
 
     # Enable TF32 for A100+ (compute capability >= 8.0)
     # TF32 gives ~3x speedup for float32 matmul with minimal precision loss
     if cc_major >= 8:
         try:
-            # CuPy uses cuBLAS which respects CUBLAS_TF32_TENSOR_MATH
             os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':16:8')
-            # Enable TF32 in cuBLAS
-            _cp.cublas.setPointerMode = None  # trigger cublas init
+            os.environ.setdefault('NVIDIA_TF32_OVERRIDE', '1')
         except Exception:
             pass
 

@@ -16,10 +16,10 @@ from mc_tables import edgeTable, triTable, numVertsTable
 
 
 def roundf_digit(num, d):
-    """Round float to d-1 decimal places (floor).
+    """Round float to d decimal places (floor).
     Port of roundf_digit from MarchingCubes.cpp:51
     """
-    t = 10 ** (d - 1)
+    t = 10 ** d
     return math.floor(num * t) / t
 
 
@@ -267,14 +267,19 @@ class MarchingCube:
                 v1 = vertlists[i_vox, e1]
                 v2 = vertlists[i_vox, e2]
 
-                # Normal via cross product
+                # Normal via cross product (normalized)
                 edge0 = v1 - v0
                 edge1 = v2 - v0
                 nx = edge0[1] * edge1[2] - edge0[2] * edge1[1]
                 ny = edge0[2] * edge1[0] - edge0[0] * edge1[2]
                 nz = edge0[0] * edge1[1] - edge0[1] * edge1[0]
+                nmag = math.sqrt(nx * nx + ny * ny + nz * nz)
+                if nmag > 1e-12:
+                    nx /= nmag
+                    ny /= nmag
+                    nz /= nmag
 
-                if out_index < output_size - 3:
+                if 0 <= out_index and out_index + 2 < output_size:
                     self.d_pos[out_index] = [v0[0], v0[1], v0[2], 1.0]
                     self.d_normal[out_index] = [nx, ny, nz, 0.0]
                     self.d_pos[out_index + 1] = [v1[0], v1[1], v1[2], 1.0]
@@ -307,7 +312,7 @@ class MarchingCube:
         with open(filename + ".stl", 'w') as f:
             f.write("solid ascii \n")
 
-            for i in range(0, total - 2, 3):
+            for i in range(0, (total // 3) * 3, 3):
                 pos = self.d_pos[i]
                 if pos[3] == 0:
                     continue
@@ -389,7 +394,7 @@ class MarchingCube:
 
             # Write triangle connectivity
             num_faces = 0
-            for i in range(0, total, 3):
+            for i in range(0, (total // 3) * 3, 3):
                 if h_pos[i, 3] == 0:
                     continue
 
@@ -408,13 +413,14 @@ class MarchingCube:
                 f.write(f"{idx1} {idx2} {idx3}\n")
 
         # Rewrite header with correct face count
-        with open(filename + ".plt", 'r') as f:
+        plt_path = filename + ".plt"
+        with open(plt_path, 'r') as f:
             lines = f.readlines()
 
-        lines[1] = f'ZONE F=FEPOINT, ET=triangle, N={len(vertices_map)} , E={num_faces}\n'
-
-        with open(filename + ".plt", 'w') as f:
-            f.writelines(lines)
+        if len(lines) >= 2:
+            lines[1] = f'ZONE F=FEPOINT, ET=triangle, N={len(vertices_map)} , E={num_faces}\n'
+            with open(plt_path, 'w') as f:
+                f.writelines(lines)
 
         print("plt file write complete", file=sys.stderr)
         print(filename + ".plt")

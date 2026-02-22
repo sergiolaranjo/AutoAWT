@@ -91,11 +91,12 @@ def read_bmp_files(file_list):
                 else:
                     img = img.convert('L')
                     channel = 1
-
-        if channel == 3:
-            img = img.convert('RGB')
         else:
-            img = img.convert('L')
+            # Subsequent images: convert to match the first image's channel
+            if channel == 3:
+                img = img.convert('RGB')
+            else:
+                img = img.convert('L')
 
         raw_data = np.array(img)
         data_ptr = np.zeros((height, width), dtype=np.uint16)
@@ -148,7 +149,9 @@ def read_dcm_for_pixel_spacing(file_list):
     volume_position = np.zeros(3, dtype=np.float32)
     patient_id = ""
     once_volume_position = True
+    slice_locations = []
 
+    # Single pass: extract PixelSpacing, PatientID, ImagePositionPatient, SliceLocation
     for i, filepath in enumerate(file_list):
         try:
             ds = pydicom.dcmread(filepath)
@@ -167,7 +170,6 @@ def read_dcm_for_pixel_spacing(file_list):
             ps = ds.PixelSpacing
             pixel_spacing[0] = float(ps[0])
             pixel_spacing[1] = float(ps[1])
-            pixel_spacing[2] = 0.5  # placeholder, computed below
 
         # ImagePositionPatient from first file
         if once_volume_position and hasattr(ds, 'ImagePositionPatient'):
@@ -177,29 +179,21 @@ def read_dcm_for_pixel_spacing(file_list):
             volume_position[2] = float(ipp[2])
             once_volume_position = False
 
-    # Compute z-spacing from SliceLocation differences
-    pixel_spacing[2] = 0.0
-    voxel_depth_size = float(len(file_list))
-    prev_slice_loc = None
-
-    for i, filepath in enumerate(file_list):
-        try:
-            ds = pydicom.dcmread(filepath)
-        except Exception:
-            continue
-
+        # SliceLocation for z-spacing computation
         if hasattr(ds, 'SliceLocation'):
-            slice_loc = float(ds.SliceLocation)
-            if i == 0:
-                pixel_spacing[2] = slice_loc
-                prev_slice_loc = slice_loc
-            else:
-                diff = slice_loc - pixel_spacing[2]
-                if voxel_depth_size > diff:
-                    voxel_depth_size = diff
-                pixel_spacing[2] = slice_loc
+            slice_locations.append(float(ds.SliceLocation))
 
-    pixel_spacing[2] = abs(voxel_depth_size)
+    if len(slice_locations) >= 2:
+        slice_locations.sort()
+        z_diffs = [abs(slice_locations[i+1] - slice_locations[i])
+                   for i in range(len(slice_locations) - 1)]
+        z_diffs = [d for d in z_diffs if d > 0]
+        if z_diffs:
+            pixel_spacing[2] = float(np.median(z_diffs))
+        else:
+            pixel_spacing[2] = 0.5
+    else:
+        pixel_spacing[2] = 0.5
 
     print(f"volume_position={volume_position[0]}, {volume_position[1]}, {volume_position[2]}")
     print(f"pixel_spacing={pixel_spacing[0]}, {pixel_spacing[1]}, {pixel_spacing[2]}")
@@ -352,7 +346,7 @@ def compute_fill_space(result_buffer, convex_points, idx, volume_size, view):
     hull_pts = np.array(convex_points, dtype=np.float64)
 
     if view == CTview.AXIAL:
-        if idx >= d:
+        if idx < 0 or idx >= d:
             return result_buffer
         tx_range = np.arange(w, dtype=np.float64)
         ty_range = np.arange(h, dtype=np.float64)
@@ -361,7 +355,7 @@ def compute_fill_space(result_buffer, convex_points, idx, volume_size, view):
         result_buffer[idx, :, :] = np.where(inside, np.uint16(1), np.uint16(0))
 
     elif view == CTview.SAGITTAL:
-        if idx >= w:
+        if idx < 0 or idx >= w:
             return result_buffer
         tx_range = np.arange(d, dtype=np.float64)  # tx maps to z
         ty_range = np.arange(h, dtype=np.float64)
@@ -372,7 +366,7 @@ def compute_fill_space(result_buffer, convex_points, idx, volume_size, view):
         result_buffer[:, :, idx] = inside_uint.T  # Transpose: (d, h)
 
     elif view == CTview.CORONAL:
-        if idx >= h:
+        if idx < 0 or idx >= h:
             return result_buffer
         tx_range = np.arange(w, dtype=np.float64)
         ty_range = np.arange(d, dtype=np.float64)  # ty maps to z

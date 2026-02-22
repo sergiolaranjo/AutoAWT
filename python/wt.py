@@ -132,8 +132,8 @@ def _build_laplacian_3d(shape, interior_mask):
     cols = []
     vals = []
 
-    # Diagonal: -6 for each interior voxel
-    diag_val = np.full(n_interior, -6.0, dtype=np.float64)
+    # Diagonal: start at 0, decrement for each valid neighbor direction
+    diag_val = np.zeros(n_interior, dtype=np.float64)
 
     for offset_idx, offset in enumerate(offsets):
         neighbor_flat = interior_indices + offset
@@ -155,6 +155,9 @@ def _build_laplacian_3d(shape, interior_mask):
         valid_indices = np.where(valid)[0]
         valid_neighbors = neighbor_flat[valid_indices]
 
+        # Each valid neighbor contributes -1 to the diagonal
+        diag_val[valid_indices] -= 1.0
+
         # Check if neighbor is also interior
         neighbor_eq = vol_to_eq[valid_neighbors]
         is_interior_neighbor = neighbor_eq >= 0
@@ -167,19 +170,6 @@ def _build_laplacian_3d(shape, interior_mask):
             rows.append(r)
             cols.append(c)
             vals.append(np.ones(np.sum(int_mask), dtype=np.float64))
-
-        # Boundary neighbors: they don't exist as unknowns, so adjust diagonal
-        # (the boundary value contribution goes to RHS, handled separately)
-        bnd_mask = ~is_interior_neighbor
-        if np.any(bnd_mask):
-            # These neighbors are boundary - their contribution is in RHS
-            # Diagonal stays -6, but we effectively have fewer off-diagonal entries
-            pass
-
-        # Voxels at the edge of the volume (no neighbor exists): adjust diagonal
-        invalid_indices = np.where(~valid)[0]
-        if len(invalid_indices) > 0:
-            diag_val[invalid_indices] += 1.0  # One less neighbor → -6 + 1 = -5, etc.
 
     # Add diagonal
     rows.append(np.arange(n_interior, dtype=np.int64))
@@ -281,9 +271,9 @@ def _solve_sparse_gpu(A_csr, b_vec, method='cg', tol=1e-5, maxiter=500):
         if method == 'cg':
             x_gpu, info = csla.cg(A_gpu, b_gpu, tol=tol, maxiter=maxiter)
         elif method == 'bicgstab':
-            # CuPy doesn't have bicgstab — use cg for symmetric or lsqr fallback
+            # CuPy may not have bicgstab — try gmres, then cg as fallback
             try:
-                x_gpu, info = csla.lsqr(A_gpu, b_gpu)[:2]
+                x_gpu, info = csla.gmres(A_gpu, b_gpu, tol=tol, maxiter=maxiter)
             except (AttributeError, TypeError):
                 x_gpu, info = csla.cg(A_gpu, b_gpu, tol=tol, maxiter=maxiter)
         else:
@@ -291,7 +281,10 @@ def _solve_sparse_gpu(A_csr, b_vec, method='cg', tol=1e-5, maxiter=500):
 
         dt = time.time() - t0
         print(f"  GPU sparse solve: {dt:.2f}s (info={info})", file=sys.stderr)
-        return cp.asnumpy(x_gpu), info
+
+        result_cpu = cp.asnumpy(x_gpu)
+        del A_gpu, b_gpu, x_gpu
+        return result_cpu, info
 
     except Exception as e:
         print(f"  GPU sparse solve failed: {e}", file=sys.stderr)
@@ -654,9 +647,20 @@ def compute_thickness_coupled_pde(phi, vectorfields, wall_mask, voxel_size):
     phi_d = to_device(phi)
 
     grad_phi_d = _xp.zeros((*shape, 3), dtype=_xp.float32)
+    # Central differences for interior
     grad_phi_d[:, :, 1:-1, 0] = (phi_d[:, :, 2:] - phi_d[:, :, :-2]) * (0.5 / sx)
     grad_phi_d[:, 1:-1, :, 1] = (phi_d[:, 2:, :] - phi_d[:, :-2, :]) * (0.5 / sy)
     grad_phi_d[1:-1, :, :, 2] = (phi_d[2:, :, :] - phi_d[:-2, :, :]) * (0.5 / sz)
+    # Forward/backward differences at boundaries
+    if shape[2] > 1:
+        grad_phi_d[:, :, 0, 0] = (phi_d[:, :, 1] - phi_d[:, :, 0]) / sx
+        grad_phi_d[:, :, -1, 0] = (phi_d[:, :, -1] - phi_d[:, :, -2]) / sx
+    if shape[1] > 1:
+        grad_phi_d[:, 0, :, 1] = (phi_d[:, 1, :] - phi_d[:, 0, :]) / sy
+        grad_phi_d[:, -1, :, 1] = (phi_d[:, -1, :] - phi_d[:, -2, :]) / sy
+    if shape[0] > 1:
+        grad_phi_d[0, :, :, 2] = (phi_d[1, :, :] - phi_d[0, :, :]) / sz
+        grad_phi_d[-1, :, :, 2] = (phi_d[-1, :, :] - phi_d[-2, :, :]) / sz
 
     # Normalize to unit normal: n = grad(phi) / |grad(phi)|
     mag = _xp.sqrt(grad_phi_d[:, :, :, 0]**2 + grad_phi_d[:, :, :, 1]**2 +
@@ -710,7 +714,7 @@ def compute_thickness_coupled_pde(phi, vectorfields, wall_mask, voxel_size):
     # Build T_epi: solve with gradient reversed (flow from epi to endo)
     # Negate gradient to reverse the direction
     grad_phi_rev = -grad_phi
-    A_epi, idx_epi = _build_advection_operator(grad_phi_rev, interior_endo, shape, voxel_size)
+    A_epi, idx_epi = _build_advection_operator(grad_phi_rev, interior_epi, shape, voxel_size)
     A_epi = A_epi + sp.eye(A_epi.shape[0], format='csr') * 1e-6
     b_epi = np.ones(len(idx_epi), dtype=np.float64)
 
@@ -742,19 +746,9 @@ def compute_thickness_coupled_pde(phi, vectorfields, wall_mask, voxel_size):
         endo_vertices[:, 1] = endo_coords[:, 1].astype(np.float32)  # y
         endo_vertices[:, 2] = endo_coords[:, 0].astype(np.float32)  # z
 
-        # Sample thickness: use nearest wall voxel thickness for endo surface
-        # Since endo surface is at T_endo=0, we need the thickness from neighboring wall voxels
-        for i in range(len(endo_coords)):
-            z, y, x = endo_coords[i]
-            # Check 6-neighbors for wall thickness
-            best_t = 0.0
-            for dz, dy, dx in [(0,0,1),(0,0,-1),(0,1,0),(0,-1,0),(1,0,0),(-1,0,0)]:
-                nz, ny, nx = z+dz, y+dy, x+dx
-                if 0 <= nz < D and 0 <= ny < H and 0 <= nx < W:
-                    t = thickness_field[nz, ny, nx]
-                    if t > best_t:
-                        best_t = t
-            endo_vertices[i, 3] = best_t
+        # Sample thickness: use max of 6-neighbors (vectorized with maximum_filter)
+        max_thickness = ndimage.maximum_filter(thickness_field, size=3, mode='constant', cval=0.0)
+        endo_vertices[:, 3] = max_thickness[endo_coords[:, 0], endo_coords[:, 1], endo_coords[:, 2]]
     else:
         endo_vertices = np.zeros((0, 4), dtype=np.float32)
 
@@ -830,6 +824,7 @@ def _compute_thickness_single_rk4(start_x, start_y, start_z,
     prev_dx = 0.0
     prev_dy = 0.0
     prev_dz = 0.0
+    first_sample = True
     state = True
     thickness = 0.0
 
@@ -845,6 +840,13 @@ def _compute_thickness_single_rk4(start_x, start_y, start_z,
 
         if vf3 > 0:
             state = False
+            # Initialize prev direction from first gradient sample
+            if first_sample:
+                prev_dx = vf0 * mode_sign
+                prev_dy = vf1 * mode_sign
+                prev_dz = vf2 * mode_sign
+                first_sample = False
+
             dot_val = prev_dx * vf0 + prev_dy * vf1 + prev_dz * vf2
 
             if dot_val >= 0:
@@ -962,8 +964,6 @@ if HAS_NUMBA:
                 vector_fields, wall_mask,
                 w, h, d, voxel_size, mode_sign
             )
-            if idx % 50000 == 0 and idx > 0:
-                print("  thickness progress:", idx, "/", N)
 
         return result
 else:
@@ -1074,8 +1074,9 @@ void rk4_thickness_kernel(
         if (ix >= W || iy >= H || iz >= D || ix < 0 || iy < 0 || iz < 0) break;
 
         // Trilinear-interpolated vector field at current position
+        // Use px,py,pz directly (already offset by +0.5 at start, matching Python)
         float vf0, vf1, vf2, vf3;
-        trilinear_vf(vector_fields, W, H, D, px - 0.5f, py - 0.5f, pz - 0.5f,
+        trilinear_vf(vector_fields, W, H, D, px, py, pz,
                      vf0, vf1, vf2, vf3);
 
         if (vf3 > 0) {
@@ -1096,24 +1097,24 @@ void rk4_thickness_kernel(
                     float k1x = dx * dt, k1y = dy * dt, k1z = dz * dt;
 
                     // k2 — midpoint using k1
-                    float mx = px + k1x*0.5f - 0.5f;
-                    float my = py + k1y*0.5f - 0.5f;
-                    float mz = pz + k1z*0.5f - 0.5f;
+                    float mx = px + k1x*0.5f;
+                    float my = py + k1y*0.5f;
+                    float mz = pz + k1z*0.5f;
                     float m0, m1, m2, m3;
                     trilinear_vf(vector_fields, W, H, D, mx, my, mz, m0, m1, m2, m3);
                     float k2x = m0*mode_sign*dt, k2y = m1*mode_sign*dt, k2z = m2*mode_sign*dt;
 
                     // k3 — midpoint using k2
-                    mx = px + k2x*0.5f - 0.5f;
-                    my = py + k2y*0.5f - 0.5f;
-                    mz = pz + k2z*0.5f - 0.5f;
+                    mx = px + k2x*0.5f;
+                    my = py + k2y*0.5f;
+                    mz = pz + k2z*0.5f;
                     trilinear_vf(vector_fields, W, H, D, mx, my, mz, m0, m1, m2, m3);
                     float k3x = m0*mode_sign*dt, k3y = m1*mode_sign*dt, k3z = m2*mode_sign*dt;
 
                     // k4 — endpoint using k3
-                    mx = px + k3x - 0.5f;
-                    my = py + k3y - 0.5f;
-                    mz = pz + k3z - 0.5f;
+                    mx = px + k3x;
+                    my = py + k3y;
+                    mz = pz + k3z;
                     trilinear_vf(vector_fields, W, H, D, mx, my, mz, m0, m1, m2, m3);
                     float k4x = m0*mode_sign*dt, k4y = m1*mode_sign*dt, k4z = m2*mode_sign*dt;
 
@@ -1245,6 +1246,7 @@ class WT:
         d_vf3D_backbuf = np.zeros((d, h, w), dtype=np.float32)
 
         self.m_convex_mask = inverse_mask_uint16(self.m_convex_mask)
+        # Invert wall_mask for Laplace solve (inverted back after at line below)
         self.m_wall_mask = inverse_mask_uint16(self.m_wall_mask)
 
         fillup_volume_by_mask(self.m_convex_mask, d_vf3D_frontbuf, 10.0, base_value=1)

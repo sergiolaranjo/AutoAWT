@@ -23,7 +23,7 @@ class QHull:
 
         Args:
             volume: 3D numpy array (depth, height, width), uint16
-            volume_size: (width, height, depth, channels) tuple
+            volume_size: (width, height, depth, channels) tuple (unused, kept for API compat)
             idx: slice index
             view: CTview enum value
         """
@@ -56,13 +56,14 @@ class QHull:
         n = len(self.point_cloud)
         a = self.point_cloud
         if n < 3:
-            print("Convex hull not possible")
+            if n > 0:
+                self.hull = list(a)
             return
 
-        # Find the leftmost point
+        # Find the leftmost point (break ties with lowest y)
         l = 0
         for i in range(1, n):
-            if a[i][0] < a[l][0]:
+            if a[i][0] < a[l][0] or (a[i][0] == a[l][0] and a[i][1] < a[l][1]):
                 l = i
 
         # Start from leftmost point, keep moving counterclockwise
@@ -72,12 +73,22 @@ class QHull:
 
             q = (p + 1) % n
             for i in range(n):
-                if self._orientation(a[p], a[i], a[q]) == 2:
+                ori = self._orientation(a[p], a[i], a[q])
+                if ori == 2:
+                    # i is more counterclockwise than q
                     q = i
+                elif ori == 0 and i != p:
+                    # Collinear: pick the farthest point for correct hull
+                    dist_i = (a[i][0] - a[p][0])**2 + (a[i][1] - a[p][1])**2
+                    dist_q = (a[q][0] - a[p][0])**2 + (a[q][1] - a[p][1])**2
+                    if dist_i > dist_q:
+                        q = i
 
             p = q
             if p == l:
                 break
+
+    _EPSILON = 1e-10
 
     @staticmethod
     def _orientation(p, q, r):
@@ -86,6 +97,6 @@ class QHull:
         Exact port from QHull.cpp:163-170
         """
         val = (q[1] - p[1]) * (r[0] - q[0]) - (q[0] - p[0]) * (r[1] - q[1])
-        if val == 0:
+        if abs(val) < QHull._EPSILON:
             return 0  # collinear
         return 1 if val > 0 else 2  # clock or counterclock wise

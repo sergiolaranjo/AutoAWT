@@ -154,20 +154,21 @@ def _load_dicom(path, threshold=None, **kwargs):
     ds0 = slices[0]
     patient_id = str(getattr(ds0, 'PatientID', 'Unknown'))
 
-    # Pixel spacing
+    # Pixel spacing — DICOM PixelSpacing = [row_spacing, column_spacing]
+    # Aligned with utils.py: pixel_spacing[0]=X (ps[0]), pixel_spacing[1]=Y (ps[1])
     pixel_spacing = np.array([1.0, 1.0, 0.5], dtype=np.float32)
     if hasattr(ds0, 'PixelSpacing'):
         ps = ds0.PixelSpacing
-        pixel_spacing[0] = float(ps[1])  # column spacing = X
-        pixel_spacing[1] = float(ps[0])  # row spacing = Y
+        pixel_spacing[0] = float(ps[0])
+        pixel_spacing[1] = float(ps[1])
 
-    # Z spacing from SliceLocation differences
+    # Z spacing from SliceLocation differences (use median for robustness)
     if len(slices) >= 2 and hasattr(slices[0], 'SliceLocation'):
         z_positions = [float(s.SliceLocation) for s in slices]
         z_diffs = [abs(z_positions[i+1] - z_positions[i]) for i in range(len(z_positions)-1)]
         z_diffs = [d for d in z_diffs if d > 0]
         if z_diffs:
-            pixel_spacing[2] = min(z_diffs)
+            pixel_spacing[2] = float(np.median(z_diffs))
 
     # Volume position
     volume_position = np.array([0.0, 0.0, 0.0], dtype=np.float32)
@@ -219,7 +220,8 @@ def _otsu_threshold(data):
     # Subsample for speed
     flat = data.ravel()
     if len(flat) > 1_000_000:
-        flat = flat[::len(flat)//1_000_000]
+        step = max(1, len(flat) // 1_000_000)
+        flat = flat[::step]
 
     # Remove background (very low values)
     flat = flat[flat > flat.min() + 1]
@@ -637,10 +639,13 @@ def stl_to_vtp(stl_path, vtp_path=None, thickness_plt=None):
 
 
 def _deduplicate_vertices(vertices, decimals=4):
-    """Deduplicate vertices by rounding."""
+    """Deduplicate vertices by rounding for grouping, returning original precision."""
     rounded = np.round(vertices, decimals)
-    unique, inverse = np.unique(rounded, axis=0, return_inverse=True)
-    return unique.astype(np.float32), inverse.astype(np.int32)
+    _, first_indices, inverse = np.unique(
+        rounded, axis=0, return_index=True, return_inverse=True
+    )
+    # Return original (unrounded) vertices at unique positions
+    return vertices[first_indices].astype(np.float32), inverse.astype(np.int32)
 
 
 def _map_thickness_from_plt(vertices, plt_path):

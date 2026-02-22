@@ -261,11 +261,16 @@ def show_matplotlib(results_dir):
     ax2 = fig.add_subplot(132)
     if len(nonzero) > 0:
         ax2.hist(nonzero, bins=50, color='steelblue', edgecolor='white', alpha=0.8)
-        ax2.axvline(np.mean(nonzero), color='red', linestyle='--',
-                    label=f'Mean: {np.mean(nonzero):.2f} mm')
-        ax2.axvline(np.median(nonzero), color='orange', linestyle='--',
-                    label=f'Median: {np.median(nonzero):.2f} mm')
+        mean_val = float(np.mean(nonzero))
+        median_val = float(np.median(nonzero))
+        ax2.axvline(mean_val, color='red', linestyle='--',
+                    label=f'Mean: {mean_val:.2f} mm')
+        ax2.axvline(median_val, color='orange', linestyle='--',
+                    label=f'Median: {median_val:.2f} mm')
         ax2.legend()
+    else:
+        ax2.text(0.5, 0.5, 'No non-zero thickness data', ha='center', va='center',
+                 transform=ax2.transAxes)
     ax2.set_xlabel('Thickness (mm)')
     ax2.set_ylabel('Count')
     ax2.set_title('Thickness Distribution')

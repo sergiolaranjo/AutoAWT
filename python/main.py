@@ -156,22 +156,22 @@ def run_pipeline(g_wall_mask, volume_size, g_pixel_spacing, volume_position,
     calc_time = (time.time() - st_time) * 1000
     print(f"Wall thickness: {calc_time:.0f}ms ({calc_time / 1e3:.1f}s)", file=sys.stderr)
 
-    # Copy results
-    g_wall_mask[:] = wt_algorithms.get_chamber_mask()
+    # Copy chamber mask into g_wall_mask (reuse array for Marching Cubes input)
+    chamber_mask = wt_algorithms.get_chamber_mask()
     endo_vertices_list = list(wt_algorithms.m_endo_vertices_list)
     del wt_algorithms
 
-    # Step 3: Surface Mesh Generation (Marching Cubes)
+    # Step 3: Surface Mesh Generation (Marching Cubes) — uses chamber mask
     surfaces = MarchingCube(
-        output_path, g_wall_mask, volume_size,
+        output_path, chamber_mask, volume_size,
         g_pixel_spacing, volume_position, MarchingCube.FROM_HOST
     )
-    surfaces.compute_isosurface(g_wall_mask, MarchingCube.FROM_HOST)
+    surfaces.compute_isosurface(chamber_mask, MarchingCube.FROM_HOST)
     surfaces.save_mesh_info(
         os.path.join(output_path, f"WT(projected)-{patient_id}"),
         endo_vertices_list
     )
-    del merged_hull
+    del chamber_mask, merged_hull
 
     # Step 4: ParaView export
     if export_paraview:
@@ -300,6 +300,10 @@ def _run_legacy_mode(args):
     file_names = get_file_list(bmp_path, '.bmp')
     print(f"Found {len(file_names)} BMP files")
 
+    if len(file_names) == 0:
+        print("No BMP files found in directory", file=sys.stderr)
+        return 1
+
     g_wall_mask, volume_size = read_bmp_files(file_names)
     if g_wall_mask is None:
         return 1
@@ -316,6 +320,10 @@ def _run_legacy_mode(args):
 
     dcm_files = get_file_list(dcm_path, '.dcm')
     print(f"Found {len(dcm_files)} DICOM files")
+
+    if len(dcm_files) == 0:
+        print("No DICOM files found in directory", file=sys.stderr)
+        return 1
 
     g_pixel_spacing, volume_position, patient_id = read_dcm_for_pixel_spacing(dcm_files)
 
@@ -342,7 +350,11 @@ def _run_interactive_mode(args):
         if not path:
             return 1
         threshold_str = input("HU threshold (Enter for auto): ").strip()
-        threshold = float(threshold_str) if threshold_str else None
+        try:
+            threshold = float(threshold_str) if threshold_str else None
+        except ValueError:
+            print(f"Invalid threshold '{threshold_str}', using auto-detection", file=sys.stderr)
+            threshold = None
         args.input = path
         args.threshold = threshold
         args.format = 'dicom'
@@ -364,7 +376,11 @@ def _run_interactive_mode(args):
         if not path:
             return 1
         threshold_str = input("Threshold (Enter for auto): ").strip()
-        threshold = float(threshold_str) if threshold_str else None
+        try:
+            threshold = float(threshold_str) if threshold_str else None
+        except ValueError:
+            print(f"Invalid threshold '{threshold_str}', using auto-detection", file=sys.stderr)
+            threshold = None
         args.input = path
         args.threshold = threshold
         return _run_input_mode(args)
