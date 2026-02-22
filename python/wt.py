@@ -243,24 +243,33 @@ def _build_rhs(in_vol, shape, interior_indices, vol_to_eq):
 def _solve_sparse_gpu(A_csr, b_vec, method='cg', tol=1e-5, maxiter=500):
     """Solve sparse system on GPU using CuPy.
 
+    Only used for symmetric positive-definite systems (method='cg').
+    Non-symmetric systems (advection operator) should use CPU BiCGSTAB
+    for reliable convergence.
+
     Args:
         A_csr: scipy CSR matrix
         b_vec: numpy RHS vector
-        method: 'cg' (symmetric) or 'bicgstab' (non-symmetric)
+        method: 'cg' only (symmetric systems)
         tol: convergence tolerance
         maxiter: maximum iterations
 
     Returns:
-        (x, info) or None if GPU solve fails
+        (x, info) or None if GPU solve fails or method not suitable
     """
     if not GPU_AVAILABLE:
         return None
+
+    # Only use GPU for symmetric CG — non-symmetric systems (bicgstab/gmres)
+    # don't converge reliably on GPU with CuPy's iterative solvers
+    if method != 'cg':
+        return None
+
     try:
         import cupy as cp
         import cupyx.scipy.sparse as csp
         import cupyx.scipy.sparse.linalg as csla
 
-        # Ensure compatible dtypes — CuPy sparse needs float64 or float32
         A_f64 = A_csr.astype(np.float64)
         b_f64 = b_vec.astype(np.float64)
 
@@ -268,22 +277,23 @@ def _solve_sparse_gpu(A_csr, b_vec, method='cg', tol=1e-5, maxiter=500):
         b_gpu = cp.asarray(b_f64)
 
         t0 = time.time()
-        if method == 'cg':
-            x_gpu, info = csla.cg(A_gpu, b_gpu, tol=tol, maxiter=maxiter)
-        elif method == 'bicgstab':
-            # CuPy may not have bicgstab — try gmres, then cg as fallback
-            try:
-                x_gpu, info = csla.gmres(A_gpu, b_gpu, tol=tol, maxiter=maxiter)
-            except (AttributeError, TypeError):
-                x_gpu, info = csla.cg(A_gpu, b_gpu, tol=tol, maxiter=maxiter)
-        else:
-            x_gpu, info = csla.cg(A_gpu, b_gpu, tol=tol, maxiter=maxiter)
-
+        x_gpu, info = csla.cg(A_gpu, b_gpu, tol=tol, maxiter=maxiter)
         dt = time.time() - t0
-        print(f"  GPU sparse solve: {dt:.2f}s (info={info})", file=sys.stderr)
+
+        # Verify convergence with residual check
+        residual = b_gpu - A_gpu.dot(x_gpu)
+        rel_residual = float(cp.linalg.norm(residual) / max(cp.linalg.norm(b_gpu), 1e-12))
+
+        print(f"  GPU sparse CG: {dt:.2f}s (info={info}, rel_residual={rel_residual:.2e})", file=sys.stderr)
 
         result_cpu = cp.asnumpy(x_gpu)
-        del A_gpu, b_gpu, x_gpu
+        del A_gpu, b_gpu, x_gpu, residual
+
+        # Reject if residual too large (solver didn't converge)
+        if rel_residual > 0.01:
+            print(f"  GPU residual too large ({rel_residual:.2e}), falling back to CPU", file=sys.stderr)
+            return None
+
         return result_cpu, info
 
     except Exception as e:
@@ -693,14 +703,11 @@ def compute_thickness_coupled_pde(phi, vectorfields, wall_mask, voxel_size):
     n_unknowns = len(idx_endo)
     print(f"Solving coupled PDE for T_endo ({n_unknowns} unknowns)...", file=sys.stderr)
 
-    # Try GPU first, then CPU BiCGSTAB, then spsolve
-    gpu_result = _solve_sparse_gpu(A_endo, b_endo, method='bicgstab', tol=1e-4, maxiter=500)
-    if gpu_result is not None:
-        T_endo_vals, info_endo = gpu_result
-    else:
-        T_endo_vals, info_endo = sla.bicgstab(A_endo, b_endo, rtol=1e-4, maxiter=500)
+    # Use CPU BiCGSTAB for non-symmetric advection operator
+    # (GPU iterative solvers don't converge reliably for this system)
+    T_endo_vals, info_endo = sla.bicgstab(A_endo, b_endo, rtol=1e-4, maxiter=1000)
     if info_endo != 0:
-        print(f"  T_endo solver info={info_endo}, trying spsolve", file=sys.stderr)
+        print(f"  T_endo BiCGSTAB info={info_endo}, trying spsolve", file=sys.stderr)
         try:
             T_endo_vals = sla.spsolve(A_endo, b_endo)
         except Exception:
@@ -719,13 +726,9 @@ def compute_thickness_coupled_pde(phi, vectorfields, wall_mask, voxel_size):
     b_epi = np.ones(len(idx_epi), dtype=np.float64)
 
     print(f"Solving coupled PDE for T_epi ({len(idx_epi)} unknowns)...", file=sys.stderr)
-    gpu_result = _solve_sparse_gpu(A_epi, b_epi, method='bicgstab', tol=1e-4, maxiter=500)
-    if gpu_result is not None:
-        T_epi_vals, info_epi = gpu_result
-    else:
-        T_epi_vals, info_epi = sla.bicgstab(A_epi, b_epi, rtol=1e-4, maxiter=500)
+    T_epi_vals, info_epi = sla.bicgstab(A_epi, b_epi, rtol=1e-4, maxiter=1000)
     if info_epi != 0:
-        print(f"  T_epi solver info={info_epi}, trying spsolve", file=sys.stderr)
+        print(f"  T_epi BiCGSTAB info={info_epi}, trying spsolve", file=sys.stderr)
         try:
             T_epi_vals = sla.spsolve(A_epi, b_epi)
         except Exception:
