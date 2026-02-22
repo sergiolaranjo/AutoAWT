@@ -442,14 +442,15 @@ def cuda_ccl(volume, degree_of_connectivity=4):
 # ============================================================
 
 def _build_advection_operator(grad_phi, interior_mask, shape, voxel_size):
-    """Build the sparse advection operator for grad(phi) . grad(T) = 1.
+    """Build the sparse advection operator for n . grad(T) = 1.
 
+    grad_phi should be the unit normal field n = ∇φ/|∇φ| (dimensionless).
     Uses first-order upwind finite differences for stability:
-        If grad_phi_x > 0: dT/dx ≈ (T[i] - T[i-1]) / dx  (backward difference)
-        If grad_phi_x < 0: dT/dx ≈ (T[i+1] - T[i]) / dx  (forward difference)
+        If n_x > 0: dT/dx ≈ (T[i] - T[i-1]) / dx  (backward difference)
+        If n_x < 0: dT/dx ≈ (T[i+1] - T[i]) / dx  (forward difference)
 
     Args:
-        grad_phi: (D, H, W, 3) gradient of Laplace solution
+        grad_phi: (D, H, W, 3) unit normal field (normalized gradient of phi)
         interior_mask: boolean 3D array of unknowns
         shape: (D, H, W)
         voxel_size: [sx, sy, sz] voxel spacing
@@ -600,12 +601,22 @@ def compute_thickness_coupled_pde(phi, vectorfields, wall_mask, voxel_size):
     t0 = time.time()
     shape = phi.shape
     D, H, W = shape
+    sx, sy, sz = float(voxel_size[0]), float(voxel_size[1]), float(voxel_size[2])
 
-    # Compute gradient of phi (central differences)
+    # Compute gradient of phi in PHYSICAL units (mm)
     grad_phi = np.zeros((*shape, 3), dtype=np.float32)
-    grad_phi[:, :, 1:-1, 0] = (phi[:, :, 2:] - phi[:, :, :-2]) * 0.5
-    grad_phi[:, 1:-1, :, 1] = (phi[:, 2:, :] - phi[:, :-2, :]) * 0.5
-    grad_phi[1:-1, :, :, 2] = (phi[2:, :, :] - phi[:-2, :, :]) * 0.5
+    grad_phi[:, :, 1:-1, 0] = (phi[:, :, 2:] - phi[:, :, :-2]) * 0.5 / sx
+    grad_phi[:, 1:-1, :, 1] = (phi[:, 2:, :] - phi[:, :-2, :]) * 0.5 / sy
+    grad_phi[1:-1, :, :, 2] = (phi[2:, :, :] - phi[:-2, :, :]) * 0.5 / sz
+
+    # Normalize to unit normal: n = grad(phi) / |grad(phi)|
+    # This ensures (n . grad(T)) = 1 gives T in physical distance (mm)
+    mag = np.sqrt(grad_phi[:, :, :, 0]**2 + grad_phi[:, :, :, 1]**2 +
+                  grad_phi[:, :, :, 2]**2)
+    mag = np.maximum(mag, 1e-12)  # avoid division by zero
+    grad_phi[:, :, :, 0] /= mag
+    grad_phi[:, :, :, 1] /= mag
+    grad_phi[:, :, :, 2] /= mag
 
     # Identify regions
     endo_surface = (vectorfields == 1.0)
