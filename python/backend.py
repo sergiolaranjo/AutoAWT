@@ -45,3 +45,27 @@ def get_scipy_ndimage():
             pass
     from scipy import ndimage
     return ndimage
+
+
+def get_sparse_module():
+    """Get the appropriate sparse matrix module (cupyx.scipy.sparse or scipy.sparse)."""
+    if GPU_AVAILABLE:
+        try:
+            import cupyx.scipy.sparse as csp
+            return csp
+        except ImportError:
+            pass
+    import scipy.sparse as sp
+    return sp
+
+
+def get_sparse_linalg():
+    """Get the appropriate sparse linalg module."""
+    if GPU_AVAILABLE:
+        try:
+            import cupyx.scipy.sparse.linalg as csla
+            return csla
+        except ImportError:
+            pass
+    import scipy.sparse.linalg as sla
+    return sla
