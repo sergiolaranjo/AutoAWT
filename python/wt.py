@@ -701,13 +701,19 @@ def compute_thickness_coupled_pde(phi, vectorfields, wall_mask, voxel_size):
     A_endo = A_endo + sp.eye(A_endo.shape[0], format='csr') * 1e-6
 
     n_unknowns = len(idx_endo)
-    print(f"Solving coupled PDE for T_endo ({n_unknowns} unknowns)...", file=sys.stderr)
+    print(f"Solving coupled PDE for T_endo ({n_unknowns} unknowns) [CPU BiCGSTAB]...", file=sys.stderr)
 
     # Use CPU BiCGSTAB for non-symmetric advection operator
     # (GPU iterative solvers don't converge reliably for this system)
+    t_solve = time.time()
     T_endo_vals, info_endo = sla.bicgstab(A_endo, b_endo, rtol=1e-4, maxiter=1000)
+    dt_solve = time.time() - t_solve
+    residual_endo = np.linalg.norm(A_endo @ T_endo_vals - b_endo) / max(np.linalg.norm(b_endo), 1e-12)
+    print(f"  T_endo: info={info_endo}, time={dt_solve:.1f}s, rel_residual={residual_endo:.2e}, "
+          f"min={np.min(T_endo_vals):.4f}, max={np.max(T_endo_vals):.4f}, mean={np.mean(np.abs(T_endo_vals)):.4f}",
+          file=sys.stderr)
     if info_endo != 0:
-        print(f"  T_endo BiCGSTAB info={info_endo}, trying spsolve", file=sys.stderr)
+        print(f"  T_endo BiCGSTAB did not converge, trying spsolve", file=sys.stderr)
         try:
             T_endo_vals = sla.spsolve(A_endo, b_endo)
         except Exception:
@@ -725,10 +731,16 @@ def compute_thickness_coupled_pde(phi, vectorfields, wall_mask, voxel_size):
     A_epi = A_epi + sp.eye(A_epi.shape[0], format='csr') * 1e-6
     b_epi = np.ones(len(idx_epi), dtype=np.float64)
 
-    print(f"Solving coupled PDE for T_epi ({len(idx_epi)} unknowns)...", file=sys.stderr)
+    print(f"Solving coupled PDE for T_epi ({len(idx_epi)} unknowns) [CPU BiCGSTAB]...", file=sys.stderr)
+    t_solve = time.time()
     T_epi_vals, info_epi = sla.bicgstab(A_epi, b_epi, rtol=1e-4, maxiter=1000)
+    dt_solve = time.time() - t_solve
+    residual_epi = np.linalg.norm(A_epi @ T_epi_vals - b_epi) / max(np.linalg.norm(b_epi), 1e-12)
+    print(f"  T_epi: info={info_epi}, time={dt_solve:.1f}s, rel_residual={residual_epi:.2e}, "
+          f"min={np.min(T_epi_vals):.4f}, max={np.max(T_epi_vals):.4f}, mean={np.mean(np.abs(T_epi_vals)):.4f}",
+          file=sys.stderr)
     if info_epi != 0:
-        print(f"  T_epi BiCGSTAB info={info_epi}, trying spsolve", file=sys.stderr)
+        print(f"  T_epi BiCGSTAB did not converge, trying spsolve", file=sys.stderr)
         try:
             T_epi_vals = sla.spsolve(A_epi, b_epi)
         except Exception:
@@ -756,7 +768,11 @@ def compute_thickness_coupled_pde(phi, vectorfields, wall_mask, voxel_size):
         endo_vertices = np.zeros((0, 4), dtype=np.float32)
 
     t1 = time.time()
+    wt_vals = endo_vertices[:, 3] if len(endo_vertices) > 0 else np.array([0.0])
+    wt_pos = wt_vals[wt_vals > 0]
     print(f"Coupled PDE thickness computed in {t1-t0:.2f}s", file=sys.stderr)
+    print(f"  Thickness: mean={np.mean(wt_pos):.3f}mm, median={np.median(wt_pos):.3f}mm, "
+          f"max={np.max(wt_pos):.3f}mm, points={len(wt_pos)}", file=sys.stderr)
 
     return endo_vertices
 
